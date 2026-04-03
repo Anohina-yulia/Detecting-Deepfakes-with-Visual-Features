@@ -1,0 +1,7 @@
+.vs/
+model/
+*.exe
+__pycache__/
+*.pyc
+.venv/
+venv/
