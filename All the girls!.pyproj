@@ -4,13 +4,14 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>49a48bd2-621c-4527-b9d3-7bed95102bcd</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>All_the_girls_.py</StartupFile>
+    <StartupFile>app.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
     <Name>All the girls!</Name>
     <RootNamespace>All the girls!</RootNamespace>
+    <IsWindowsApplication>False</IsWindowsApplication>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -21,7 +22,18 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="All_the_girls_.py" />
+    <Compile Include="micro_expression.py" />
+    <Compile Include="app.py" />
+    <Compile Include="mimic_analyzer.py" />
+    <Compile Include="text_correction.py" />
+    <Compile Include="eye_tracker.py" />
+    <Compile Include="face_tracker.py" />
+    <Compile Include="whisper_subtitle.py" />
+    <Compile Include="subtitle_storage.py" />
+    <Compile Include="audio_module.py" />
+    <Compile Include="models.py">
+      <SubType>Code</SubType>
+    </Compile>
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
