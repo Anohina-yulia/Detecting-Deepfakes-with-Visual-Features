@@ -6,7 +6,9 @@ import queue
 import textwrap
 import re
 from difflib import SequenceMatcher
+from collections import deque
 
+import mediapipe as mp
 from faster_whisper import WhisperModel
 from PIL import ImageFont, ImageDraw, Image
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -270,12 +272,215 @@ class WhisperSubtitleModule:
             return lines[-2:]
 
 
+class EyeTrackerModule:
+    LEFT_EYE_EAR = [33, 159, 158, 133, 153, 145]
+    RIGHT_EYE_EAR = [362, 386, 385, 263, 380, 374]
+
+    LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+    RIGHT_EYE_CONTOUR = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466]
+
+    LEFT_IRIS = [468, 469, 470, 471, 472]
+    RIGHT_IRIS = [473, 474, 475, 476, 477]
+
+    LEFT_EYE_CORNERS = [33, 133]
+    RIGHT_EYE_CORNERS = [362, 263]
+
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+
+        self.ear_threshold = 0.21
+        self.min_closed_frames = 2
+
+        self.closed_frames = 0
+        self.blink_count = 0
+        self.blink_in_progress = False
+        self.ear_history = deque(maxlen=5)
+
+        self.last_gaze = "центр"
+        self.last_ear = 0.0
+
+        try:
+            self.font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 24)
+        except Exception:
+            self.font = ImageFont.load_default()
+
+    def close(self):
+        if self.face_mesh is not None:
+            self.face_mesh.close()
+
+    def to_pixel(self, landmark, width, height):
+        x = min(max(int(landmark.x * width), 0), width - 1)
+        y = min(max(int(landmark.y * height), 0), height - 1)
+        return (x, y)
+
+    def get_points(self, face_landmarks, indices, width, height):
+        points = []
+        for index in indices:
+            landmark = face_landmarks.landmark[index]
+            points.append(self.to_pixel(landmark, width, height))
+        return points
+
+    def distance(self, p1, p2):
+        return float(np.linalg.norm(np.array(p1) - np.array(p2)))
+
+    def compute_ear(self, points):
+        p1, p2, p3, p4, p5, p6 = points
+
+        horizontal = self.distance(p1, p4)
+        if horizontal == 0:
+            return 0.0
+
+        vertical_1 = self.distance(p2, p6)
+        vertical_2 = self.distance(p3, p5)
+
+        return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+    def estimate_gaze_ratio(self, iris_points, corner_points):
+        iris_center = np.mean(np.array(iris_points), axis=0)
+        xs = [point[0] for point in corner_points]
+
+        min_x = float(min(xs))
+        max_x = float(max(xs))
+        width = max_x - min_x
+
+        if width <= 1:
+            return 0.5
+
+        ratio = (iris_center[0] - min_x) / width
+        return float(np.clip(ratio, 0.0, 1.0))
+
+    def classify_gaze(self, ratio):
+        if ratio < 0.42:
+            return "влево"
+        if ratio > 0.58:
+            return "вправо"
+        return "центр"
+
+    def update_blink_counter(self, ear):
+        self.ear_history.append(ear)
+        smooth_ear = float(sum(self.ear_history) / len(self.ear_history))
+        self.last_ear = smooth_ear
+
+        if smooth_ear < self.ear_threshold:
+            self.closed_frames += 1
+            if self.closed_frames >= self.min_closed_frames:
+                self.blink_in_progress = True
+        else:
+            if self.blink_in_progress:
+                self.blink_count += 1
+            self.closed_frames = 0
+            self.blink_in_progress = False
+
+    def draw_eye_shape(self, frame, points, color):
+        if len(points) < 2:
+            return
+        contour = np.array(points, dtype=np.int32)
+        cv2.polylines(frame, [contour], True, color, 1, cv2.LINE_AA)
+
+    def draw_iris(self, frame, points):
+        if not points:
+            return
+
+        center = np.mean(np.array(points), axis=0).astype(int)
+        radius = max(2, int(np.mean([
+            self.distance(center, point) for point in points
+        ])))
+
+        cv2.circle(frame, tuple(center), radius, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(frame, tuple(center), 1, (0, 255, 255), -1, cv2.LINE_AA)
+
+    def draw_panel(self, frame):
+        img = Image.fromarray(frame)
+        draw = ImageDraw.Draw(img)
+
+        x1, y1 = 20, 50
+        x2, y2 = 335, 150
+
+        draw.rounded_rectangle(
+            (x1, y1, x2, y2),
+            radius=10,
+            fill=(0, 0, 0),
+            outline=(255, 255, 255),
+            width=2
+        )
+
+        draw.text(
+            (x1 + 12, y1 + 10),
+            f"EAR: {self.last_ear:.3f}",
+            font=self.font,
+            fill=(255, 255, 255)
+        )
+        draw.text(
+            (x1 + 12, y1 + 40),
+            f"Направление: {self.last_gaze}",
+            font=self.font,
+            fill=(255, 255, 255)
+        )
+        draw.text(
+            (x1 + 12, y1 + 70),
+            f"Моргания: {self.blink_count}",
+            font=self.font,
+            fill=(255, 255, 255)
+        )
+
+        return np.array(img)
+
+    def process(self, frame):
+        height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        if not results.multi_face_landmarks:
+            frame = self.draw_panel(frame)
+            return frame
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        left_eye_points = self.get_points(face_landmarks, self.LEFT_EYE_EAR, width, height)
+        right_eye_points = self.get_points(face_landmarks, self.RIGHT_EYE_EAR, width, height)
+
+        left_eye_contour = self.get_points(face_landmarks, self.LEFT_EYE_CONTOUR, width, height)
+        right_eye_contour = self.get_points(face_landmarks, self.RIGHT_EYE_CONTOUR, width, height)
+
+        left_iris = self.get_points(face_landmarks, self.LEFT_IRIS, width, height)
+        right_iris = self.get_points(face_landmarks, self.RIGHT_IRIS, width, height)
+
+        left_corners = self.get_points(face_landmarks, self.LEFT_EYE_CORNERS, width, height)
+        right_corners = self.get_points(face_landmarks, self.RIGHT_EYE_CORNERS, width, height)
+
+        left_ear = self.compute_ear(left_eye_points)
+        right_ear = self.compute_ear(right_eye_points)
+        avg_ear = (left_ear + right_ear) / 2.0
+
+        self.update_blink_counter(avg_ear)
+
+        left_ratio = self.estimate_gaze_ratio(left_iris, left_corners)
+        right_ratio = self.estimate_gaze_ratio(right_iris, right_corners)
+        gaze_ratio = (left_ratio + right_ratio) / 2.0
+        self.last_gaze = self.classify_gaze(gaze_ratio)
+
+        self.draw_eye_shape(frame, left_eye_contour, (255, 0, 255))
+        self.draw_eye_shape(frame, right_eye_contour, (255, 0, 255))
+        self.draw_iris(frame, left_iris)
+        self.draw_iris(frame, right_iris)
+
+        frame = self.draw_panel(frame)
+        return frame
+
+
 class App:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
         self.audio = AudioModule()
         self.whisper = WhisperSubtitleModule(model_size="small")
         self.corrector = SafeMeaningCorrectionModule()
+        self.eye_tracker = EyeTrackerModule()
         self.storage = SubtitleStorage(
             live_file="subtitles_live.txt",
             final_file="subtitles.txt"
@@ -474,7 +679,7 @@ class App:
         whisper_thread = threading.Thread(target=self.whisper_loop, daemon=True)
         whisper_thread.start()
 
-        print("Видео, микрофон и субтитры запущены")
+        print("Видео, микрофон, субтитры и отслеживание глаз запущены")
         print("Нажмите 'q' для выхода")
         print("Быстрые субтитры: subtitles_live.txt")
         print("Улучшенный текст: subtitles.txt")
@@ -489,6 +694,7 @@ class App:
             lines = self.whisper.get_display_lines()
 
             frame = self.draw_bar(frame, volume)
+            frame = self.eye_tracker.process(frame)
             frame = self.draw_subtitles(frame, lines)
 
             cv2.imshow("Webcam", frame)
@@ -499,6 +705,7 @@ class App:
         self.running = False
         self.cap.release()
         self.audio.stop()
+        self.eye_tracker.close()
         cv2.destroyAllWindows()
 
 
