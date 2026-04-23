@@ -5,3 +5,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.venv_main/
+.venv_emotion/
+models_cache/
+results/
+/analysis_log.csv
+/subtitles.txt
+/subtitles_live.txt

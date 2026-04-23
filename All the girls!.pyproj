@@ -22,12 +22,26 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="analysis_logger.py" />
+    <Compile Include="emotion_analyzer.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="emotion_bridge.py" />
+    <Compile Include="emotion_worker.py" />
     <Compile Include="micro_expression.py" />
     <Compile Include="app.py" />
     <Compile Include="mimic_analyzer.py" />
+    <Compile Include="NeuralFaceAnalyzerModule.pyw" />
+    <Compile Include="neural_face_analyzer.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="quality_analyzer.py" />
+    <Compile Include="redness_analyzer.py" />
+    <Compile Include="suspicion_analyzer.py" />
     <Compile Include="text_correction.py" />
     <Compile Include="eye_tracker.py" />
     <Compile Include="face_tracker.py" />
+    <Compile Include="video_analysis_worker.py" />
     <Compile Include="whisper_subtitle.py" />
     <Compile Include="subtitle_storage.py" />
     <Compile Include="audio_module.py" />

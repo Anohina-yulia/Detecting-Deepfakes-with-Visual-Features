@@ -11,17 +11,26 @@ from audio_module import AudioModule
 from text_correction import SafeMeaningCorrectionModule
 from subtitle_storage import SubtitleStorage
 from whisper_subtitle import WhisperSubtitleModule
-from face_tracker import FaceTrackerModule
+from neural_face_analyzer import NeuralFaceAnalyzerModule
 from eye_tracker import EyeTrackerModule
 from mimic_analyzer import MimicAnalyzerModule
 from micro_expression import MicroExpressionModule
+from analysis_logger import AnalysisLogger
+from redness_analyzer import RednessAnalyzerModule
+from suspicion_analyzer import SuspicionAnalyzerModule
+from quality_analyzer import QualityAnalyzerModule
+from video_analysis_worker import VideoAnalysisWorker
+from models import MimicData, RednessData
 
 
 class App:
     def __init__(self):
-        self.cap = cv2.VideoCapture(0)
+        cv2.setUseOptimized(True)
+
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self.audio = AudioModule()
         self.whisper = WhisperSubtitleModule(model_size="small")
@@ -31,14 +40,47 @@ class App:
             final_file="subtitles.txt"
         )
 
-        self.face_tracker = FaceTrackerModule()
+        # Одна модель для UI: лицо/глаза/рамка каждый кадр
+        self.neural_face_ui = NeuralFaceAnalyzerModule(
+            model_path="models/face_landmarker.task"
+        )
+
+        # Вторая модель для фонового анализа: мимика/покраснения
+        self.neural_face_bg = NeuralFaceAnalyzerModule(
+            model_path="models/face_landmarker.task"
+        )
+
         self.eye_tracker = EyeTrackerModule()
         self.mimic_analyzer = MimicAnalyzerModule()
         self.micro_module = MicroExpressionModule()
+        self.redness_analyzer = RednessAnalyzerModule()
+        self.suspicion_analyzer = SuspicionAnalyzerModule()
+        self.quality_analyzer = QualityAnalyzerModule()
+
+        self.analysis_worker = VideoAnalysisWorker(
+            neural_face=self.neural_face_bg,
+            mimic_analyzer=self.mimic_analyzer,
+            micro_module=self.micro_module,
+            redness_analyzer=self.redness_analyzer,
+            quality_analyzer=self.quality_analyzer,
+            submit_every_n=2
+        )
+
+        self.analysis_logger = AnalysisLogger(
+            filepath="analysis_log.csv",
+            min_interval_sec=0.7
+        )
 
         self.running = True
         self.audio_buffer = []
-        self.buffer_seconds = 2.0
+        self.buffer_seconds = 2.2
+        self.frame_index = 0
+
+        self.last_mimic_data = MimicData()
+        self.last_micro_event = None
+        self.last_redness_data = RednessData(status="ожидание")
+        self.last_redness_boxes = {}
+        self.last_suspicion_data = None
 
         try:
             self.font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 18)
@@ -47,18 +89,22 @@ class App:
 
     def draw_bar(self, frame, volume):
         bar_width = int(min(volume * 2500, 180))
-
         cv2.rectangle(frame, (20, 20), (210, 38), (255, 255, 255), 2)
         cv2.rectangle(frame, (20, 20), (20 + bar_width, 38), (0, 255, 0), -1)
+        return frame
 
+    def draw_face_box(self, frame, face_data):
+        if not face_data.detected or not face_data.bbox:
+            return frame
+
+        x1, y1, x2, y2 = face_data.bbox
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2, cv2.LINE_AA)
         return frame
 
     def prepare_lines_for_display(self, lines, width=34, max_lines=2):
         wrapped = []
-
         for line in lines:
             wrapped.extend(textwrap.wrap(line, width=width) or [""])
-
         return wrapped[-max_lines:]
 
     def draw_subtitles(self, frame, lines, face_data=None):
@@ -89,8 +135,7 @@ class App:
             overlap_y = not (fy2 < y1 or fy1 > y2)
 
             if overlap_x and overlap_y:
-                new_y1 = max(fy1 - box_height - 10, 10)
-                y1 = new_y1
+                y1 = max(fy1 - box_height - 10, 10)
                 y2 = y1 + box_height
 
         draw.rounded_rectangle(
@@ -109,8 +154,7 @@ class App:
             )
             y_text += 24
 
-        result = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        return result
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
     def collect_transcription(self, segments):
         text_parts = []
@@ -144,19 +188,12 @@ class App:
         if not text:
             return False
 
-        words = text.split()
-        if len(words) < 3:
+        if len(text.split()) < 3:
             return False
 
         broken = self.corrector.looks_broken(text)
-
-        low_confidence = False
-        if avg_logprob is not None and avg_logprob < -0.8:
-            low_confidence = True
-
-        suspicious_silence = False
-        if avg_no_speech_prob is not None and avg_no_speech_prob > 0.5:
-            suspicious_silence = True
+        low_confidence = avg_logprob is not None and avg_logprob < -0.8
+        suspicious_silence = avg_no_speech_prob is not None and avg_no_speech_prob > 0.5
 
         return broken or low_confidence or suspicious_silence
 
@@ -167,10 +204,6 @@ class App:
             return text
 
         words = text.split()
-
-        if len(words) <= 2:
-            return text
-
         if len(words) > 14:
             text = " ".join(words[:14])
 
@@ -182,11 +215,7 @@ class App:
         if not cleaned:
             return cleaned
 
-        if self.should_apply_meaning_correction(
-            cleaned,
-            avg_logprob,
-            avg_no_speech_prob
-        ):
+        if self.should_apply_meaning_correction(cleaned, avg_logprob, avg_no_speech_prob):
             return self.corrector.correct(cleaned)
 
         return cleaned
@@ -209,8 +238,8 @@ class App:
                         audio_data,
                         language="ru",
                         vad_filter=True,
-                        beam_size=2,
-                        best_of=2,
+                        beam_size=1,
+                        best_of=1,
                         condition_on_previous_text=False
                     )
 
@@ -243,10 +272,14 @@ class App:
         whisper_thread = threading.Thread(target=self.whisper_loop, daemon=True)
         whisper_thread.start()
 
-        print("Видео, микрофон, субтитры, лицо, взгляд и мимика запущены")
+        print("Видео, микрофон, субтитры, лицо, взгляд, мимика, покраснения и индикатор запущены")
+        print("Калибровка идёт автоматически после запуска")
         print("Нажмите 'q' для выхода")
+        print("Нажмите 'c' для повторной калибровки мимики")
+        print("Нажмите 'r' для повторной калибровки покраснений")
         print("Быстрые субтитры: subtitles_live.txt")
         print("Улучшенный текст: subtitles.txt")
+        print("Лог анализа: analysis_log.csv")
 
         while True:
             ret, frame = self.cap.read()
@@ -256,30 +289,72 @@ class App:
 
             volume = self.audio.get_volume()
             lines = self.whisper.get_display_lines()
+            subtitle_text = lines[-1] if lines else ""
 
-            face_data = self.face_tracker.process(frame)
-            mimic_data = self.mimic_analyzer.process(face_data)
-            micro_event = self.micro_module.update(mimic_data, face_data.timestamp)
+            # СВЕЖЕЕ лицо для глаз/рамки каждый кадр
+            current_face_data, _ = self.neural_face_ui.process(frame, self.frame_index)
+
+            # Фоновый тяжёлый анализ
+            self.analysis_worker.submit(frame, self.frame_index)
+            snapshot = self.analysis_worker.get_latest()
+
+            if snapshot.mimic_data is not None:
+                self.last_mimic_data = snapshot.mimic_data
+            if snapshot.redness_data is not None:
+                self.last_redness_data = snapshot.redness_data
+            if snapshot.redness_boxes is not None:
+                self.last_redness_boxes = snapshot.redness_boxes
+            if snapshot.micro_event is not None or self.last_micro_event is None:
+                self.last_micro_event = snapshot.micro_event
+
+            neural_mimic_data = self.last_mimic_data
+            redness_data = self.last_redness_data
+            micro_event = self.last_micro_event
 
             frame = self.draw_bar(frame, volume)
-            frame = self.face_tracker.draw_face_box(frame, face_data)
-            frame = self.eye_tracker.process(frame, face_data)
-            frame = self.mimic_analyzer.draw_panel(frame, mimic_data, micro_event)
-            frame = self.draw_subtitles(frame, lines, face_data)
+            frame = self.draw_face_box(frame, current_face_data)
+            frame = self.eye_tracker.process(frame, current_face_data)
+
+            suspicion_data = self.suspicion_analyzer.process(
+                eye_tracker=self.eye_tracker,
+                mimic_data=neural_mimic_data,
+                subtitle_text=subtitle_text
+            )
+            self.last_suspicion_data = suspicion_data
+
+            self.analysis_logger.log(
+                face_data=current_face_data,
+                eye_tracker=self.eye_tracker,
+                mimic_data=neural_mimic_data,
+                micro_event=micro_event,
+                subtitle_text=subtitle_text,
+                redness_data=redness_data,
+                suspicion_data=suspicion_data
+            )
+
+            frame = self.mimic_analyzer.draw_panel(frame, neural_mimic_data, micro_event)
+            frame = self.redness_analyzer.draw_panel(frame, redness_data)
+            frame = self.suspicion_analyzer.draw_panel(frame, suspicion_data)
+            frame = self.draw_subtitles(frame, lines, current_face_data)
 
             cv2.imshow("Webcam", frame)
 
-            key = cv2.waitKey(1) & 0xFF
+            self.frame_index += 1
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
             elif key == ord("c"):
                 self.mimic_analyzer.start_calibration()
+            elif key == ord("r"):
+                self.redness_analyzer.start_calibration()
 
         self.running = False
+        self.analysis_worker.close()
         self.cap.release()
         self.audio.stop()
-        self.face_tracker.close()
+        self.neural_face_ui.close()
+        self.neural_face_bg.close()
         cv2.destroyAllWindows()
 
 

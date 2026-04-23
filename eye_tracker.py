@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from collections import deque
 
 import cv2
@@ -27,15 +28,23 @@ class EyeTrackerModule:
         self.blink_in_progress = False
         self.ear_history = deque(maxlen=5)
 
+        self.horizontal_history = deque(maxlen=5)
+        self.vertical_history = deque(maxlen=5)
+
         self.last_gaze = "не найдено"
         self.last_ear = 0.0
         self.face_found = False
         self.last_face_position = "не найдено"
 
+        self.last_horizontal_ratio = 0.5
+        self.last_vertical_ratio = 0.5
+
         try:
-            self.font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 18)
+            self.font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 17)
+            self.small_font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 15)
         except Exception:
             self.font = ImageFont.load_default()
+            self.small_font = ImageFont.load_default()
 
     def distance(self, p1, p2):
         return float(np.linalg.norm(np.array(p1) - np.array(p2)))
@@ -117,6 +126,10 @@ class EyeTrackerModule:
             self.closed_frames = 0
             self.blink_in_progress = False
 
+    def smooth_ratio(self, history, value):
+        history.append(float(value))
+        return float(sum(history) / len(history))
+
     def draw_eye_shape(self, frame, points, color):
         if len(points) < 2:
             return
@@ -135,14 +148,73 @@ class EyeTrackerModule:
         cv2.circle(frame, tuple(center), radius, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.circle(frame, tuple(center), 1, (0, 255, 255), -1, cv2.LINE_AA)
 
+    def draw_center_bar(self, draw, x, y, width, height, value, label, left_label, right_label):
+        draw.text((x, y - 2), label, font=self.small_font, fill=(255, 255, 255))
+
+        bar_x1 = x + 100
+        bar_y1 = y + 2
+        bar_x2 = bar_x1 + width
+        bar_y2 = bar_y1 + height
+
+        draw.rounded_rectangle(
+            (bar_x1, bar_y1, bar_x2, bar_y2),
+            radius=5,
+            fill=(45, 45, 45),
+            outline=(110, 110, 110),
+            width=1
+        )
+
+        center_x = (bar_x1 + bar_x2) // 2
+        draw.line((center_x, bar_y1 - 2, center_x, bar_y2 + 2), fill=(170, 170, 170), width=1)
+
+        value = max(0.0, min(1.0, float(value)))
+        marker_x = int(bar_x1 + value * width)
+        draw.rounded_rectangle(
+            (marker_x - 4, bar_y1 - 1, marker_x + 4, bar_y2 + 1),
+            radius=3,
+            fill=(80, 190, 255)
+        )
+
+        draw.text((bar_x1, bar_y2 + 3), left_label, font=self.small_font, fill=(190, 190, 190))
+        right_text_x = bar_x2 - 18
+        draw.text((right_text_x, bar_y2 + 3), right_label, font=self.small_font, fill=(190, 190, 190))
+
+    def draw_value_bar(self, draw, x, y, width, height, value, label):
+        draw.text((x, y - 2), label, font=self.small_font, fill=(255, 255, 255))
+
+        bar_x1 = x + 100
+        bar_y1 = y + 2
+        bar_x2 = bar_x1 + width
+        bar_y2 = bar_y1 + height
+
+        draw.rounded_rectangle(
+            (bar_x1, bar_y1, bar_x2, bar_y2),
+            radius=5,
+            fill=(45, 45, 45),
+            outline=(110, 110, 110),
+            width=1
+        )
+
+        value = max(0.0, min(1.0, float(value)))
+        fill_width = int(width * value)
+
+        if fill_width > 0:
+            draw.rounded_rectangle(
+                (bar_x1, bar_y1, bar_x1 + fill_width, bar_y2),
+                radius=5,
+                fill=(80, 190, 255)
+            )
+
+        draw.text((bar_x2 + 8, y - 2), f"{value:.2f}", font=self.small_font, fill=(255, 255, 255))
+
     def draw_panel(self, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         draw = ImageDraw.Draw(img)
-        
+
         x1, y1 = 15, 50
-        x2, y2 = 320, 185
-        
+        x2, y2 = 390, 285
+
         draw.rounded_rectangle(
             (x1, y1, x2, y2),
             radius=10,
@@ -150,22 +222,35 @@ class EyeTrackerModule:
             outline=(255, 255, 255),
             width=2
         )
-        
+
         face_text = "да" if self.face_found else "нет"
-        
-        lines = [
-            f"Лицо: {face_text}",
-            f"Положение: {self.last_face_position}",
-            f"Взгляд: {self.last_gaze}",
-            f"EAR: {self.last_ear:.3f}",
-            f"Моргания: {self.blink_count}"
-        ]
-        
-        y = y1 + 10
-        for line in lines:
-            draw.text((x1 + 12, y), line, font=self.font, fill=(255, 255, 255))
-            y += 24
-            
+
+        draw.text((x1 + 12, y1 + 10), f"Лицо: {face_text}", font=self.font, fill=(255, 255, 255))
+        draw.text((x1 + 12, y1 + 36), f"Положение: {self.last_face_position}", font=self.small_font, fill=(220, 220, 220))
+        draw.text((x1 + 12, y1 + 58), f"Взгляд: {self.last_gaze}", font=self.small_font, fill=(220, 220, 220))
+        draw.text((x1 + 12, y1 + 80), f"Моргания: {self.blink_count}", font=self.small_font, fill=(220, 220, 220))
+
+        start_y = y1 + 112
+        gap = 40
+        bar_width = 170
+        bar_height = 14
+
+        self.draw_center_bar(
+            draw, x1 + 12, start_y + gap * 0, bar_width, bar_height,
+            self.last_horizontal_ratio, "Горизонталь", "L", "R"
+        )
+
+        self.draw_center_bar(
+            draw, x1 + 12, start_y + gap * 1, bar_width, bar_height,
+            self.last_vertical_ratio, "Вертикаль", "U", "D"
+        )
+
+        ear_visual = min(self.last_ear / 0.45, 1.0)
+        self.draw_value_bar(
+            draw, x1 + 12, start_y + gap * 2, bar_width, bar_height,
+            ear_visual, "Открыт. глаз"
+        )
+
         result = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         return result
 
@@ -205,7 +290,10 @@ class EyeTrackerModule:
         right_vertical = self.estimate_vertical_gaze_ratio(right_iris, right_eye_contour)
         vertical_ratio = (left_vertical + right_vertical) / 2.0
 
-        self.last_gaze = self.classify_gaze(horizontal_ratio, vertical_ratio)
+        self.last_horizontal_ratio = self.smooth_ratio(self.horizontal_history, horizontal_ratio)
+        self.last_vertical_ratio = self.smooth_ratio(self.vertical_history, vertical_ratio)
+
+        self.last_gaze = self.classify_gaze(self.last_horizontal_ratio, self.last_vertical_ratio)
 
         self.draw_eye_shape(frame, left_eye_contour, (255, 0, 255))
         self.draw_eye_shape(frame, right_eye_contour, (255, 0, 255))

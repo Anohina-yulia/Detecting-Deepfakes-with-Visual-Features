@@ -1,5 +1,15 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+
+@dataclass
+class RednessData:
+    overall: float = 0.0
+    left_cheek: float = 0.0
+    right_cheek: float = 0.0
+    nose: float = 0.0
+    forehead: float = 0.0
+    status: str = "нет данных"
 
 
 @dataclass
