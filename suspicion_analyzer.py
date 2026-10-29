@@ -1,438 +1,325 @@
 # -*- coding: utf-8 -*-
-import re
-import time
-from dataclasses import dataclass
-from collections import deque, Counter
+"""Индикатор напряжения.
 
-import cv2
+ВАЖНО: это эвристика по мимике, морганиям, взгляду и речи. Она показывает
+отклонение человека от его же собственной базы, но НЕ определяет ложь:
+стресс, усталость, свет и камера дают такие же изменения у честных людей.
+"""
+import re
+from collections import Counter, deque
+from dataclasses import dataclass, replace
+
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+
+from models import GAZE_CENTER
+from ui_widgets import (BLUE, GRAY, GRAY_DARK, GREEN, ORANGE, RED, WHITE, YELLOW,
+                        clamp01, draw_bar, load_font, new_panel, to_bgra)
+
+BASELINE_SECONDS = 40.0   # сколько секунд с хорошим кадром собирается личная база
+BLINK_WINDOW = 25.0       # окно подсчёта морганий, с
+GAZE_WINDOW = 15.0        # окно оценки взгляда, с
+SPEECH_WINDOW = 30.0      # окно оценки речи, с
+MIN_WORDS = 8             # меньше слов речь не оценивается
+
+STATUS_CALIBRATION = "калибровка"
+STATUS_CALM = "спокойно"
+STATUS_MODERATE = "умеренно"
+STATUS_RAISED = "повышено"
+STATUS_HIGH = "высокое"
+
+VERDICT_NORMAL = "в пределах нормы"
+VERDICT_UNCERTAIN = "неопределённо"
+VERDICT_ABOVE = "выше обычного"
+
+FILLER_PATTERNS = [re.compile(p) for p in (
+    r"\bээ+\b", r"\bэм+\b", r"\bну\b", r"\bкак бы\b", r"\bтипа\b",
+    r"\bкороче\b", r"\bэто самое\b", r"\bв общем\b")]
+CORRECTION_PATTERNS = [re.compile(p) for p in (
+    r"\bточнее\b", r"\bвернее\b", r"\bто есть\b", r"\bв смысле\b", r"\bнет\s*,")]
 
 
 @dataclass
 class SuspicionData:
     overall: float = 0.0
-    status: str = "калибровка"
-    verdict: str = "неопределённо"
+    status: str = STATUS_CALIBRATION
+    verdict: str = VERDICT_UNCERTAIN
+
     mimic_risk: float = 0.0
     blink_risk: float = 0.0
     gaze_risk: float = 0.0
     text_risk: float = 0.0
+
     note: str = ""
     baseline_ready: bool = False
-    baseline_progress: int = 0
+    baseline_progress: int = 0  # процент готовности базы
 
 
 class SuspicionAnalyzerModule:
     def __init__(self):
-        self.blink_history = deque(maxlen=180)
-        self.gaze_history = deque(maxlen=90)
-        self.text_history = deque(maxlen=30)
+        self.blink_history = deque(maxlen=2000)
+        self.gaze_history = deque(maxlen=1000)
+        self.speech = deque()  # (время, текст)
 
+        self.overall_history = deque(maxlen=10)
+        self.verdict_history = deque(maxlen=8)
+        self.status_history = deque(maxlen=8)
+        self.last_stable_status = STATUS_CALM
+        self.last_stable_verdict = VERDICT_UNCERTAIN
+
+        self.last_data = SuspicionData()
+        self.start_calibration(silent=True)
+        self._use_defaults()  # работает сразу, без ожидания
+
+    # ---------- калибровка ----------
+
+    def start_calibration(self, silent=False):
         self.baseline_ready = False
         self.baseline_samples = []
-
+        self.valid_time = 0.0
+        self.last_t = None
+        self.blink_start_count = None
         self.base_mimic = 0.0
         self.base_blink_rate = 0.0
-        self.base_gaze_score = 0.0
-        self.base_text_score = 0.0
+        self.base_gaze = 0.0
+        self.base_text = 0.0
+        self.overall_history.clear()
+        self.status_history.clear()
+        self.verdict_history.clear()
+        self.last_data = SuspicionData()
+        if not silent:
+            print("Калибровка индикатора напряжения: говорите и ведите себя как обычно.")
 
-        # Стабилизация
-        self.overall_history = deque(maxlen=12)
-        self.verdict_history = deque(maxlen=10)
-        self.last_stable_verdict = "неопределённо"
-        self.last_stable_status = "калибровка"
+    def _use_defaults(self):
+        """Типичные значения вместо личной базы: индикатор работает с первой секунды."""
+        self.baseline_ready = True
+        self.base_mimic = 0.05
+        self.base_blink_rate = 17.0
+        self.base_gaze = 0.25
+        self.base_text = 0.10
+        self.last_data = SuspicionData(status=STATUS_CALM, verdict=VERDICT_UNCERTAIN,
+                                       baseline_ready=True, baseline_progress=100)
 
-        try:
-            self.font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 17)
-            self.small_font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 15)
-        except Exception:
-            self.font = ImageFont.load_default()
-            self.small_font = ImageFont.load_default()
+    # ---------- речь ----------
 
-    def clamp01(self, value):
-        return float(max(0.0, min(1.0, value)))
+    def feed_speech(self, text, now):
+        text = (text or "").strip().lower()
+        if text:
+            self.speech.append((now, text))
 
-    def shorten_text(self, text, max_len=34):
-        if len(text) <= max_len:
-            return text
-        return text[:max_len - 3] + "..."
+    def _trim_speech(self, now):
+        while self.speech and now - self.speech[0][0] > SPEECH_WINDOW:
+            self.speech.popleft()
 
-    def update_blink_history(self, blink_count):
-        now = time.time()
-        self.blink_history.append((now, int(blink_count)))
+    def analyze_speech(self):
+        """Оценка по ВСЕМ фразам окна (каждая считается один раз)."""
+        if not self.speech:
+            return 0.0, "нет речи", False
 
-        while self.blink_history and (now - self.blink_history[0][0]) > 25.0:
+        text = " ".join(t for _, t in self.speech)
+        words = re.findall(r"\w+", text)
+        if len(words) < MIN_WORDS:
+            return 0.0, "мало речи", False
+
+        filler_hits = sum(len(p.findall(text)) for p in FILLER_PATTERNS)
+        correction_hits = sum(len(p.findall(text)) for p in CORRECTION_PATTERNS)
+        repeats = sum(1 for i in range(1, len(words)) if words[i] == words[i - 1])
+
+        n = float(len(words))
+        score = clamp01(0.35 * min(filler_hits / n / 0.08, 1.0)
+                        + 0.30 * min(correction_hits / n / 0.04, 1.0)
+                        + 0.35 * min(repeats / n / 0.04, 1.0))
+
+        if filler_hits / n > 0.05:
+            note = "много слов-паразитов"
+        elif correction_hits / n > 0.025:
+            note = "самоисправления"
+        elif repeats / n > 0.025:
+            note = "повторы слов"
+        else:
+            note = "спокойная речь"
+        return score, note, True
+
+    # ---------- сигналы ----------
+
+    def _blink_rate(self, now):
+        while self.blink_history and now - self.blink_history[0][0] > BLINK_WINDOW:
             self.blink_history.popleft()
-
-    def compute_blink_rate_per_min(self):
         if len(self.blink_history) < 2:
+            return None
+        (t0, b0), (t1, b1) = self.blink_history[0], self.blink_history[-1]
+        if t1 - t0 < 10.0:  # слишком короткое окно - частота ненадёжна
+            return None
+        return max(b1 - b0, 0) / (t1 - t0) * 60.0
+
+    def _blink_risk(self, now):
+        rate = self._blink_rate(now)
+        if rate is None:
             return 0.0
-
-        t0, b0 = self.blink_history[0]
-        t1, b1 = self.blink_history[-1]
-
-        dt = max(t1 - t0, 1e-6)
-        return float((max(b1 - b0, 0) / dt) * 60.0)
-
-    def compute_blink_risk(self):
-        current_rate = self.compute_blink_rate_per_min()
-
-        if not self.baseline_ready:
-            if current_rate <= 18:
-                return 0.0
-            if current_rate <= 28:
-                return self.clamp01((current_rate - 18) / 10.0 * 0.5)
-            return self.clamp01(0.5 + (current_rate - 28) / 18.0)
-
-        delta = current_rate - self.base_blink_rate
-
+        delta = abs(rate - self.base_blink_rate)  # и учащение, и урежение
         if delta <= 4:
             return 0.0
         if delta <= 10:
-            return self.clamp01((delta - 4) / 6.0 * 0.5)
-        return self.clamp01(0.5 + (delta - 10) / 12.0)
+            return clamp01((delta - 4) / 6.0 * 0.55)
+        return clamp01(0.55 + (delta - 10) / 12.0)
 
-    def update_gaze_history(self, gaze):
-        now = time.time()
-        self.gaze_history.append((now, gaze))
-
-        while self.gaze_history and (now - self.gaze_history[0][0]) > 15.0:
+    def _gaze_score(self, now):
+        while self.gaze_history and now - self.gaze_history[0][0] > GAZE_WINDOW:
             self.gaze_history.popleft()
-
-    def compute_gaze_score(self):
-        if len(self.gaze_history) < 3:
-            return 0.0
-
         gazes = [g for _, g in self.gaze_history]
-        non_center = sum(1 for g in gazes if g != "центр" and g != "не найдено")
-        changes = 0
+        if len(gazes) < 3:
+            return 0.0
+        non_center = sum(1 for g in gazes if g != GAZE_CENTER) / len(gazes)
+        changes = sum(1 for i in range(1, len(gazes)) if gazes[i] != gazes[i - 1])
+        return clamp01(0.55 * non_center + 0.45 * changes / max(len(gazes) - 1, 1))
 
-        for i in range(1, len(gazes)):
-            if gazes[i] != gazes[i - 1]:
-                changes += 1
+    @staticmethod
+    def _mimic_score(m):
+        raw = (0.34 * m.brow_frown + 0.22 * m.eye_squint
+               + 0.18 * m.mouth_open + 0.12 * m.brow_raise) - 0.22 * m.smile
+        return clamp01(raw)
 
-        non_center_ratio = non_center / max(len(gazes), 1)
-        change_ratio = changes / max(len(gazes) - 1, 1)
+    # ---------- стабилизация ----------
 
-        return self.clamp01(0.55 * non_center_ratio + 0.45 * change_ratio)
+    @staticmethod
+    def status_from_score(score):
+        if score < 0.15:
+            return STATUS_CALM
+        if score < 0.30:
+            return STATUS_MODERATE
+        if score < 0.48:
+            return STATUS_RAISED
+        return STATUS_HIGH
 
-    def compute_gaze_risk(self):
-        current_score = self.compute_gaze_score()
+    @staticmethod
+    def verdict_from_score(score):
+        if score < 0.22:
+            return VERDICT_NORMAL
+        if score < 0.56:
+            return VERDICT_UNCERTAIN
+        return VERDICT_ABOVE
 
-        if not self.baseline_ready:
-            return current_score
+    @staticmethod
+    def stabilize(history, current, last):
+        history.append(current)
+        if len(history) < 5:
+            return last
+        label, count = Counter(history).most_common(1)[0]
+        return label if count >= 4 else last
 
-        delta = current_score - self.base_gaze_score
-        return self.clamp01(delta * 2.2)
+    # ---------- основной вызов ----------
 
-    def analyze_text(self, text):
-        text = (text or "").strip().lower()
-        if not text:
-            return 0.0, "нет текста"
+    def process(self, eye_tracker, mimic_data, now, valid=True):
+        """now - время кадра (сек). valid=False - нет лица или плохой кадр."""
+        self._trim_speech(now)
 
-        self.text_history.append(text)
+        if not valid:
+            self.last_t = None  # паузу не засчитываем в калибровку
+            self.last_data = replace(self.last_data, note="нет лица / плохой кадр")
+            return self.last_data
 
-        fillers = [
-            "ээ", "эм", "ну", "как бы", "типа", "короче",
-            "это самое", "в общем", "ну вот"
-        ]
-        correction_words = ["нет", "точнее", "в смысле", "то есть", "вернее"]
+        dt = 0.0 if self.last_t is None else min(max(now - self.last_t, 0.0), 1.0)
+        self.last_t = now
 
-        filler_hits = sum(text.count(token) for token in fillers)
-        correction_hits = sum(text.count(token) for token in correction_words)
+        self.blink_history.append((now, int(eye_tracker.blink_count)))
+        self.gaze_history.append((now, eye_tracker.last_gaze))
 
-        words = re.findall(r"\w+", text, flags=re.UNICODE)
-        repeated_words = 0
-        for i in range(1, len(words)):
-            if words[i] == words[i - 1]:
-                repeated_words += 1
-
-        punctuation_absent = 0 if any(ch in text for ch in ".!,?") else 1
-        very_short = 1 if len(words) <= 2 else 0
-
-        raw = (
-            0.30 * min(filler_hits, 3) / 3.0 +
-            0.25 * min(correction_hits, 3) / 3.0 +
-            0.25 * min(repeated_words, 2) / 2.0 +
-            0.10 * punctuation_absent +
-            0.10 * very_short
-        )
-
-        score = self.clamp01(raw)
-
-        if filler_hits >= 2:
-            note = "много пауз/слов-паразитов"
-        elif correction_hits >= 2:
-            note = "самоисправления"
-        elif repeated_words >= 1:
-            note = "повторы"
-        else:
-            note = "спокойная речь"
-
-        return score, note
-
-    def compute_text_risk(self, text):
-        current_score, note = self.analyze_text(text)
+        mimic_score = self._mimic_score(mimic_data)
+        gaze_score = self._gaze_score(now)
+        text_score, text_note, has_speech = self.analyze_speech()
 
         if not self.baseline_ready:
-            return current_score, note
+            if self.blink_start_count is None:
+                self.blink_start_count = int(eye_tracker.blink_count)
+            self.valid_time += dt
+            self.baseline_samples.append((mimic_score, gaze_score, text_score, has_speech))
 
-        delta = current_score - self.base_text_score
-        return self.clamp01(delta * 2.0), note
+            if self.valid_time >= BASELINE_SECONDS:
+                self._finish_baseline(eye_tracker)
+            else:
+                self.last_data = SuspicionData(
+                    status=STATUS_CALIBRATION,
+                    verdict=VERDICT_UNCERTAIN,
+                    note="сбор личной базы",
+                    baseline_ready=False,
+                    baseline_progress=int(100 * self.valid_time / BASELINE_SECONDS),
+                )
+                return self.last_data
 
-    def analyze_mimic(self, mimic_data):
-        smile_relief = 0.18 * float(mimic_data.smile)
+        mimic_risk = clamp01((mimic_score - self.base_mimic) * 1.8)
+        gaze_risk = clamp01((gaze_score - self.base_gaze) * 2.0)
+        blink_risk = self._blink_risk(now)
+        text_risk = clamp01((text_score - self.base_text) * 1.8) if has_speech else 0.0
 
-        raw = (
-            0.36 * float(mimic_data.brow_frown) +
-            0.22 * float(mimic_data.eye_squint) +
-            0.18 * float(mimic_data.mouth_open) +
-            0.14 * float(mimic_data.brow_raise)
-        ) - smile_relief
+        raw_overall = clamp01(0.32 * mimic_risk + 0.24 * blink_risk
+                              + 0.18 * gaze_risk + 0.26 * text_risk)
+        self.overall_history.append(raw_overall)
+        overall = float(sum(self.overall_history) / len(self.overall_history))
 
-        return self.clamp01(raw)
+        self.last_stable_status = self.stabilize(
+            self.status_history, self.status_from_score(overall), self.last_stable_status)
+        self.last_stable_verdict = self.stabilize(
+            self.verdict_history, self.verdict_from_score(overall), self.last_stable_verdict)
 
-    def compute_mimic_risk(self, mimic_data):
-        current_score = self.analyze_mimic(mimic_data)
-
-        if not self.baseline_ready:
-            return current_score
-
-        delta = current_score - self.base_mimic
-        return self.clamp01(delta * 2.0)
-
-    def update_baseline(self, mimic_data, eye_tracker, subtitle_text):
-        mimic_score = self.analyze_mimic(mimic_data)
-        blink_rate = self.compute_blink_rate_per_min()
-        gaze_score = self.compute_gaze_score()
-        text_score, _ = self.analyze_text(subtitle_text)
-
-        self.baseline_samples.append({
-            "mimic": mimic_score,
-            "blink": blink_rate,
-            "gaze": gaze_score,
-            "text": text_score
-        })
-
-        if len(self.baseline_samples) < 25:
-            return
-
-        self.base_mimic = float(np.mean([x["mimic"] for x in self.baseline_samples]))
-        self.base_blink_rate = float(np.mean([x["blink"] for x in self.baseline_samples]))
-        self.base_gaze_score = float(np.mean([x["gaze"] for x in self.baseline_samples]))
-        self.base_text_score = float(np.mean([x["text"] for x in self.baseline_samples]))
-
-        self.baseline_ready = True
-        self.baseline_samples = []
-
-    def smooth_overall(self, current_overall):
-        self.overall_history.append(float(current_overall))
-        return float(sum(self.overall_history) / len(self.overall_history))
-
-    def status_from_score(self, score):
-        if score < 0.16:
-            return "спокойно"
-        if score < 0.32:
-            return "умеренно"
-        if score < 0.52:
-            return "напряжение"
-        return "подозрительно"
-
-    def verdict_from_score(self, score):
-        if score < 0.24:
-            return "скорее правда"
-        if score < 0.50:
-            return "неопределённо"
-        return "скорее ложь"
-
-    def stabilize_verdict(self, current_verdict):
-        self.verdict_history.append(current_verdict)
-
-        if len(self.verdict_history) < 4:
-            return self.last_stable_verdict
-
-        counts = Counter(self.verdict_history)
-        most_common_verdict, most_common_count = counts.most_common(1)[0]
-
-        # Меняем вердикт только если он реально устойчив
-        if most_common_count >= 4:
-            self.last_stable_verdict = most_common_verdict
-
-        return self.last_stable_verdict
-
-    def stabilize_status(self, current_status):
-        # Лёгкая стабилизация статуса через сглаженный overall
-        self.last_stable_status = current_status
-        return self.last_stable_status
-
-    def color_from_status(self, status):
-        if status == "спокойно":
-            return (120, 230, 140)
-        if status == "умеренно":
-            return (120, 200, 255)
-        if status == "напряжение":
-            return (255, 200, 110)
-        if status == "подозрительно":
-            return (255, 120, 120)
-        return (255, 255, 255)
-
-    def color_from_verdict(self, verdict):
-        if verdict == "скорее правда":
-            return (120, 230, 140)
-        if verdict == "неопределённо":
-            return (255, 220, 120)
-        if verdict == "скорее ложь":
-            return (255, 120, 120)
-        return (255, 255, 255)
-
-    def process(self, eye_tracker, mimic_data, subtitle_text):
-        self.update_blink_history(eye_tracker.blink_count)
-        self.update_gaze_history(eye_tracker.last_gaze)
-
-        if not self.baseline_ready:
-            self.update_baseline(mimic_data, eye_tracker, subtitle_text)
-
-        blink_risk = self.compute_blink_risk()
-        gaze_risk = self.compute_gaze_risk()
-        text_risk, note = self.compute_text_risk(subtitle_text)
-        mimic_risk = self.compute_mimic_risk(mimic_data)
-
-        raw_overall = self.clamp01(
-            0.34 * mimic_risk +
-            0.24 * blink_risk +
-            0.20 * gaze_risk +
-            0.22 * text_risk
-        )
-
-        smooth_overall = self.smooth_overall(raw_overall)
-
-        if not self.baseline_ready:
-            return SuspicionData(
-                overall=smooth_overall,
-                status="калибровка",
-                verdict="неопределённо",
-                mimic_risk=mimic_risk,
-                blink_risk=blink_risk,
-                gaze_risk=gaze_risk,
-                text_risk=text_risk,
-                note="настройка личной базы",
-                baseline_ready=False,
-                baseline_progress=len(self.baseline_samples)
-            )
-
-        current_status = self.status_from_score(smooth_overall)
-        current_verdict = self.verdict_from_score(smooth_overall)
-
-        stable_status = self.stabilize_status(current_status)
-        stable_verdict = self.stabilize_verdict(current_verdict)
-
-        return SuspicionData(
-            overall=smooth_overall,
-            status=stable_status,
-            verdict=stable_verdict,
+        self.last_data = SuspicionData(
+            overall=overall,
+            status=self.last_stable_status,
+            verdict=self.last_stable_verdict,
             mimic_risk=mimic_risk,
             blink_risk=blink_risk,
             gaze_risk=gaze_risk,
             text_risk=text_risk,
-            note=note,
+            note=text_note,
             baseline_ready=True,
-            baseline_progress=25
+            baseline_progress=100,
         )
+        return self.last_data
 
-    def draw_progress_bar(self, draw, x, y, width, height, value, label, status):
-        color = self.color_from_status(status)
+    def _finish_baseline(self, eye_tracker):
+        samples = self.baseline_samples
+        self.base_mimic = float(np.mean([s[0] for s in samples]))
+        self.base_gaze = float(np.mean([s[1] for s in samples]))
+        speech_scores = [s[2] for s in samples if s[3]]
+        self.base_text = float(np.mean(speech_scores)) if speech_scores else 0.0
 
-        draw.text((x, y - 2), label, font=self.small_font, fill=color)
+        blinks = max(int(eye_tracker.blink_count) - (self.blink_start_count or 0), 0)
+        self.base_blink_rate = blinks / max(self.valid_time, 1e-6) * 60.0
 
-        bar_x1 = x + 110
-        bar_y1 = y + 2
-        bar_x2 = bar_x1 + width
-        bar_y2 = bar_y1 + height
+        self.baseline_ready = True
+        self.baseline_samples = []
+        print(f"Личная база собрана: моргания {self.base_blink_rate:.1f}/мин.")
 
-        draw.rounded_rectangle(
-            (bar_x1, bar_y1, bar_x2, bar_y2),
-            radius=5,
-            fill=(45, 45, 45),
-            outline=(110, 110, 110),
-            width=1
-        )
+    # ---------- панель ----------
 
-        fill_width = int(width * self.clamp01(value))
-        if fill_width > 0:
-            draw.rounded_rectangle(
-                (bar_x1, bar_y1, bar_x1 + fill_width, bar_y2),
-                radius=5,
-                fill=color
-            )
+    @staticmethod
+    def color_from_status(status):
+        return {STATUS_CALM: GREEN, STATUS_MODERATE: (120, 200, 255),
+                STATUS_RAISED: ORANGE, STATUS_HIGH: RED,
+                STATUS_CALIBRATION: YELLOW}.get(status, WHITE)
 
-        draw.text((bar_x2 + 8, y - 2), f"{value:.2f}", font=self.small_font, fill=(255, 255, 255))
+    @staticmethod
+    def color_from_verdict(verdict):
+        return {VERDICT_NORMAL: GREEN, VERDICT_UNCERTAIN: YELLOW,
+                VERDICT_ABOVE: RED}.get(verdict, WHITE)
 
-    def draw_panel(self, frame, suspicion_data):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        draw = ImageDraw.Draw(img)
+    def render_panel(self, d):
+        img, draw = new_panel(420, 265)
+        font, small = load_font(17), load_font(15)
 
-        frame_width = frame.shape[1]
+        status_color = self.color_from_status(d.status)
+        draw.text((12, 10), f"Напряжение: {d.status}", font=font, fill=status_color)
+        draw.text((12, 38), f"Оценка: {d.verdict}", font=font,
+                  fill=self.color_from_verdict(d.verdict))
 
-        x1 = frame_width - 420 - 15
-        y1 = 350
-        x2 = frame_width - 15
-        y2 = 630
-
-        draw.rounded_rectangle(
-            (x1, y1, x2, y2),
-            radius=10,
-            fill=(0, 0, 0),
-            outline=(255, 255, 255),
-            width=2
-        )
-
-        status_color = self.color_from_status(suspicion_data.status)
-        verdict_color = self.color_from_verdict(suspicion_data.verdict)
-
-        draw.text(
-            (x1 + 12, y1 + 10),
-            f"Индикатор: {suspicion_data.status}",
-            font=self.font,
-            fill=status_color
-        )
-        draw.text(
-            (x1 + 12, y1 + 38),
-            f"Вердикт: {suspicion_data.verdict}",
-            font=self.font,
-            fill=verdict_color
-        )
-
-        if not suspicion_data.baseline_ready:
-            note_text = f"Калибровка: {suspicion_data.baseline_progress}/25"
+        if not d.baseline_ready:
+            info = f"Калибровка: {d.baseline_progress}%"
         else:
-            note_text = f"Примечание: {self.shorten_text(suspicion_data.note)}"
+            info = f"Заметка: {d.note}"
+        draw.text((12, 66), info[:46], font=small, fill=GRAY)
 
-        draw.text(
-            (x1 + 12, y1 + 66),
-            note_text,
-            font=self.small_font,
-            fill=(220, 220, 220)
-        )
+        rows = [("Общий", d.overall), ("Мимика", d.mimic_risk), ("Моргание", d.blink_risk),
+                ("Взгляд", d.gaze_risk), ("Речь", d.text_risk)]
+        for i, (label, value) in enumerate(rows):
+            draw_bar(draw, 12, 100 + 34 * i, value, label, status_color, small,
+                     label_w=110, width=160, label_color=status_color)
 
-        start_y = y1 + 100
-        gap = 34
-        bar_width = 160
-        bar_height = 14
-
-        self.draw_progress_bar(draw, x1 + 12, start_y + gap * 0, bar_width, bar_height, suspicion_data.overall, "Общий риск", suspicion_data.status)
-        self.draw_progress_bar(draw, x1 + 12, start_y + gap * 1, bar_width, bar_height, suspicion_data.mimic_risk, "Мимика", suspicion_data.status)
-        self.draw_progress_bar(draw, x1 + 12, start_y + gap * 2, bar_width, bar_height, suspicion_data.blink_risk, "Моргания", suspicion_data.status)
-        self.draw_progress_bar(draw, x1 + 12, start_y + gap * 3, bar_width, bar_height, suspicion_data.gaze_risk, "Взгляд", suspicion_data.status)
-        self.draw_progress_bar(draw, x1 + 12, start_y + gap * 4, bar_width, bar_height, suspicion_data.text_risk, "Речь", suspicion_data.status)
-
-        draw.text(
-            (x1 + 12, y2 - 28),
-            "Оценка, не детектор лжи",
-            font=self.small_font,
-            fill=(180, 180, 180)
-        )
-
-        result = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        return result
+        return to_bgra(img)

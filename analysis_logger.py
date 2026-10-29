@@ -6,13 +6,23 @@ import threading
 import time
 from datetime import datetime
 
+HEADER = [
+    "время", "время_видео_с", "лицо_найдено", "положение_лица", "взгляд", "моргания",
+    "мимика", "улыбка", "рот_открыт", "брови_вверх", "нахмуривание", "прищур",
+    "микровыражение",
+    "покраснение_статус", "покраснение_общее", "покраснение_левая_щека",
+    "покраснение_правая_щека", "покраснение_нос", "покраснение_лоб",
+    "напряжение_статус", "напряжение_общее", "напряжение_мимика",
+    "напряжение_моргание", "напряжение_взгляд", "напряжение_речь",
+    "напряжение_заметка", "качество_кадра", "метка", "участник", "субтитры",
+]
+
 
 class AnalysisLogger:
     def __init__(self, filepath="analysis_log.csv", min_interval_sec=0.7):
         self.filepath = filepath
         self.min_interval_sec = min_interval_sec
         self.lock = threading.Lock()
-
         self.last_write_time = 0.0
         self.last_signature = None
 
@@ -21,165 +31,58 @@ class AnalysisLogger:
             os.makedirs(folder, exist_ok=True)
 
         if not os.path.exists(self.filepath) or os.path.getsize(self.filepath) == 0:
+            # utf-8-sig, чтобы Excel правильно открывал кириллицу
             with open(self.filepath, "w", newline="", encoding="utf-8-sig") as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow([
-                    "timestamp",
-                    "face_detected",
-                    "face_position",
-                    "gaze",
-                    "blink_count",
-                    "mimic",
-                    "smile",
-                    "mouth_open",
-                    "brow_raise",
-                    "brow_frown",
-                    "eye_squint",
-                    "micro_event",
-                    "redness_status",
-                    "redness_overall",
-                    "redness_left_cheek",
-                    "redness_right_cheek",
-                    "redness_nose",
-                    "redness_forehead",
-                    "suspicion_status",
-                    "suspicion_overall",
-                    "suspicion_mimic_risk",
-                    "suspicion_blink_risk",
-                    "suspicion_gaze_risk",
-                    "suspicion_text_risk",
-                    "suspicion_note",
-                    "subtitle"
-                ])
+                csv.writer(file, delimiter=";").writerow(HEADER)
 
-    def normalize_text(self, text):
-        if text is None:
-            return ""
-        text = str(text).strip()
-        text = re.sub(r"\s+", " ", text)
-        return text
+    @staticmethod
+    def normalize_text(text):
+        return re.sub(r"\s+", " ", str(text or "").strip())
 
-    def build_signature(
-        self,
-        face_detected,
-        face_position,
-        gaze,
-        blink_count,
-        mimic_name,
-        micro_event_name,
-        redness_status,
-        redness_overall,
-        suspicion_status,
-        suspicion_overall,
-        subtitle
-    ):
-        subtitle = self.normalize_text(subtitle)
-
-        return (
-            bool(face_detected),
-            str(face_position),
-            str(gaze),
-            int(blink_count),
-            str(mimic_name),
-            str(micro_event_name),
-            str(redness_status),
-            round(float(redness_overall), 3),
-            str(suspicion_status),
-            round(float(suspicion_overall), 3),
-            subtitle
-        )
-
-    def should_write(self, signature):
+    def _should_write(self, signature, force=False):
         now = time.time()
+        if self.last_signature is None or force:
+            write = True
+        else:
+            changed = signature != self.last_signature
+            enough = (now - self.last_write_time) >= self.min_interval_sec
+            periodic = (now - self.last_write_time) >= 2.5
+            write = (changed and enough) or periodic
 
-        if self.last_signature is None:
+        if write:
             self.last_signature = signature
             self.last_write_time = now
-            return True
+        return write
 
-        changed = signature != self.last_signature
-        enough_time = (now - self.last_write_time) >= self.min_interval_sec
-        periodic_write = (now - self.last_write_time) >= 2.5
-
-        if (changed and enough_time) or periodic_write:
-            self.last_signature = signature
-            self.last_write_time = now
-            return True
-
-        return False
-
-    def log(
-        self,
-        face_data,
-        eye_tracker,
-        mimic_data,
-        micro_event=None,
-        subtitle_text="",
-        redness_data=None,
-        suspicion_data=None
-    ):
+    def log(self, face_data, eye_tracker, mimic_data, micro_event=None,
+            subtitle_text="", redness_data=None, suspicion_data=None,
+            video_time=0.0, quality_note="", label="", participant="", force=False):
         if face_data is None or eye_tracker is None or mimic_data is None:
             return
 
-        micro_event_name = "нет"
-        if micro_event is not None:
-            micro_event_name = getattr(micro_event, "name", "нет")
+        micro_name = getattr(micro_event, "name", "нет") if micro_event else "нет"
+        subtitle = self.normalize_text(subtitle_text)
 
-        subtitle_text = self.normalize_text(subtitle_text)
+        r = redness_data
+        s = suspicion_data
+        red = [getattr(r, name, 0.0) if r else 0.0
+               for name in ("overall", "left_cheek", "right_cheek", "nose", "forehead")]
+        red_status = getattr(r, "status", "нет данных") if r else "нет данных"
 
-        redness_status = "нет данных"
-        redness_overall = 0.0
-        redness_left_cheek = 0.0
-        redness_right_cheek = 0.0
-        redness_nose = 0.0
-        redness_forehead = 0.0
+        sus = [getattr(s, name, 0.0) if s else 0.0
+               for name in ("overall", "mimic_risk", "blink_risk", "gaze_risk", "text_risk")]
+        sus_status = getattr(s, "status", "нет данных") if s else "нет данных"
+        sus_note = self.normalize_text(getattr(s, "note", "")) if s else ""
 
-        if redness_data is not None:
-            redness_status = getattr(redness_data, "status", "нет данных")
-            redness_overall = float(getattr(redness_data, "overall", 0.0))
-            redness_left_cheek = float(getattr(redness_data, "left_cheek", 0.0))
-            redness_right_cheek = float(getattr(redness_data, "right_cheek", 0.0))
-            redness_nose = float(getattr(redness_data, "nose", 0.0))
-            redness_forehead = float(getattr(redness_data, "forehead", 0.0))
-
-        suspicion_status = "нет данных"
-        suspicion_overall = 0.0
-        suspicion_mimic_risk = 0.0
-        suspicion_blink_risk = 0.0
-        suspicion_gaze_risk = 0.0
-        suspicion_text_risk = 0.0
-        suspicion_note = ""
-
-        if suspicion_data is not None:
-            suspicion_status = getattr(suspicion_data, "status", "нет данных")
-            suspicion_overall = float(getattr(suspicion_data, "overall", 0.0))
-            suspicion_mimic_risk = float(getattr(suspicion_data, "mimic_risk", 0.0))
-            suspicion_blink_risk = float(getattr(suspicion_data, "blink_risk", 0.0))
-            suspicion_gaze_risk = float(getattr(suspicion_data, "gaze_risk", 0.0))
-            suspicion_text_risk = float(getattr(suspicion_data, "text_risk", 0.0))
-            suspicion_note = self.normalize_text(getattr(suspicion_data, "note", ""))
-
-        signature = self.build_signature(
-            face_detected=face_data.detected,
-            face_position=face_data.face_position,
-            gaze=eye_tracker.last_gaze,
-            blink_count=eye_tracker.blink_count,
-            mimic_name=mimic_data.dominant_expression,
-            micro_event_name=micro_event_name,
-            redness_status=redness_status,
-            redness_overall=redness_overall,
-            suspicion_status=suspicion_status,
-            suspicion_overall=suspicion_overall,
-            subtitle=subtitle_text
+        signature = (
+            bool(face_data.detected), str(face_data.face_position), str(eye_tracker.last_gaze),
+            int(eye_tracker.blink_count), str(mimic_data.dominant_expression), micro_name,
+            red_status, round(red[0], 3), sus_status, round(sus[0], 3), subtitle, label,
         )
 
-        if not self.should_write(signature):
-            return
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         row = [
-            timestamp,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            round(float(video_time), 2),
             "да" if face_data.detected else "нет",
             face_data.face_position,
             eye_tracker.last_gaze,
@@ -190,24 +93,19 @@ class AnalysisLogger:
             round(float(mimic_data.brow_raise), 3),
             round(float(mimic_data.brow_frown), 3),
             round(float(mimic_data.eye_squint), 3),
-            micro_event_name,
-            redness_status,
-            round(redness_overall, 3),
-            round(redness_left_cheek, 3),
-            round(redness_right_cheek, 3),
-            round(redness_nose, 3),
-            round(redness_forehead, 3),
-            suspicion_status,
-            round(suspicion_overall, 3),
-            round(suspicion_mimic_risk, 3),
-            round(suspicion_blink_risk, 3),
-            round(suspicion_gaze_risk, 3),
-            round(suspicion_text_risk, 3),
-            suspicion_note,
-            subtitle_text
+            micro_name,
+            red_status, *[round(float(v), 3) for v in red],
+            sus_status, *[round(float(v), 3) for v in sus],
+            sus_note,
+            quality_note,
+            label,
+            participant,
+            subtitle,
         ]
 
+        # проверка "писать ли" и сама запись - под одним замком
         with self.lock:
+            if not self._should_write(signature, force):
+                return
             with open(self.filepath, "a", newline="", encoding="utf-8") as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow(row)
+                csv.writer(file, delimiter=";").writerow(row)

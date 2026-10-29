@@ -23,11 +23,13 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="analysis_logger.py" />
+    <Compile Include="capture_protect.py" />
     <Compile Include="emotion_analyzer.py">
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="emotion_bridge.py" />
     <Compile Include="emotion_worker.py" />
+    <Compile Include="evaluate_lie_signals.py" />
     <Compile Include="micro_expression.py" />
     <Compile Include="app.py" />
     <Compile Include="mimic_analyzer.py" />
@@ -41,7 +43,9 @@
     <Compile Include="text_correction.py" />
     <Compile Include="eye_tracker.py" />
     <Compile Include="face_tracker.py" />
+    <Compile Include="ui_widgets.py" />
     <Compile Include="video_analysis_worker.py" />
+    <Compile Include="video_source.py" />
     <Compile Include="whisper_subtitle.py" />
     <Compile Include="subtitle_storage.py" />
     <Compile Include="audio_module.py" />

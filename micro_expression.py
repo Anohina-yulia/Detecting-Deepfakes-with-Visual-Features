@@ -1,81 +1,73 @@
+# -*- coding: utf-8 -*-
 from collections import deque
 
 from models import MicroEvent
 
+# (название события, поле MimicData, порог значения)
+CHECKS = [
+    ("быстрый подъём бровей", "brow_raise", 0.45),
+    ("быстрое нахмуривание", "brow_frown", 0.40),
+    ("краткая улыбка", "smile", 0.45),
+    ("резкое открытие рта", "mouth_open", 0.45),
+    ("резкий прищур", "eye_squint", 0.45),
+]
+
 
 class MicroExpressionModule:
-    def __init__(self, maxlen=20, cooldown_seconds=0.8):
+    """Ищет резкие скачки мимики.
+
+    * Скорость считается между текущим кадром и кадром, который старше не менее
+      min_dt секунд (так шум двух соседних кадров не даёт ложных срабатываний).
+    * Время берётся из таймлайна кадров, поэтому для видеофайла всё корректно.
+    * Событие показывается event_ttl секунд, а не бесконечно.
+    """
+
+    def __init__(self, maxlen=40, cooldown_seconds=0.8, min_dt=0.08,
+                 max_dt=0.4, speed_threshold=2.5, event_ttl=2.0):
         self.history = deque(maxlen=maxlen)
         self.events = deque(maxlen=5)
         self.cooldown_seconds = cooldown_seconds
-        self.last_event_time = 0.0
+        self.min_dt = min_dt
+        self.max_dt = max_dt
+        self.speed_threshold = speed_threshold
+        self.event_ttl = event_ttl
+        self.last_event_time = -1e9
 
     def update(self, mimic_data, timestamp):
         self.history.append((timestamp, mimic_data))
 
-        if len(self.history) < 4:
-            return None
+        if (timestamp - self.last_event_time) < self.cooldown_seconds:
+            return self.get_active(timestamp)
 
-        _, prev = self.history[-2]
-        t_now, cur = self.history[-1]
+        reference = None
+        for t, m in reversed(self.history):
+            if timestamp - t >= self.min_dt:
+                reference = (t, m)
+                break
 
-        dt = max(t_now - self.history[-2][0], 1e-6)
+        if reference is None:
+            return self.get_active(timestamp)
 
-        smile_speed = (cur.smile - prev.smile) / dt
-        brow_raise_speed = (cur.brow_raise - prev.brow_raise) / dt
-        frown_speed = (cur.brow_frown - prev.brow_frown) / dt
-        mouth_open_speed = (cur.mouth_open - prev.mouth_open) / dt
-        squint_speed = (cur.eye_squint - prev.eye_squint) / dt
+        t_ref, prev = reference
+        dt = timestamp - t_ref
+        if dt > self.max_dt:
+            return self.get_active(timestamp)
 
-        if (t_now - self.last_event_time) < self.cooldown_seconds:
-            return self.get_last_event()
+        for name, attr, threshold in CHECKS:
+            current = getattr(mimic_data, attr)
+            speed = (current - getattr(prev, attr)) / dt
+            if speed > self.speed_threshold and current > threshold:
+                event = MicroEvent(name=name, strength=current,
+                                   duration_ms=dt * 1000.0, timestamp=timestamp)
+                self.events.append(event)
+                self.last_event_time = timestamp
+                return event
 
-        candidate = None
+        return self.get_active(timestamp)
 
-        if brow_raise_speed > 2.5 and cur.brow_raise > 0.45:
-            candidate = MicroEvent(
-                name="быстрый подъём бровей",
-                strength=cur.brow_raise,
-                duration_ms=150.0,
-                timestamp=t_now
-            )
-        elif frown_speed > 2.5 and cur.brow_frown > 0.40:
-            candidate = MicroEvent(
-                name="быстрое нахмуривание",
-                strength=cur.brow_frown,
-                duration_ms=150.0,
-                timestamp=t_now
-            )
-        elif smile_speed > 2.5 and cur.smile > 0.45:
-            candidate = MicroEvent(
-                name="краткая улыбка",
-                strength=cur.smile,
-                duration_ms=150.0,
-                timestamp=t_now
-            )
-        elif mouth_open_speed > 2.5 and cur.mouth_open > 0.45:
-            candidate = MicroEvent(
-                name="резкое открытие рта",
-                strength=cur.mouth_open,
-                duration_ms=150.0,
-                timestamp=t_now
-            )
-        elif squint_speed > 2.5 and cur.eye_squint > 0.45:
-            candidate = MicroEvent(
-                name="резкий прищур",
-                strength=cur.eye_squint,
-                duration_ms=150.0,
-                timestamp=t_now
-            )
-
-        if candidate is not None:
-            self.events.append(candidate)
-            self.last_event_time = t_now
-            return candidate
-
-        return self.get_last_event()
-
-    def get_last_event(self):
+    def get_active(self, now):
+        """Последнее событие, если оно произошло не позже event_ttl секунд назад."""
         if not self.events:
             return None
-        return self.events[-1]
+        event = self.events[-1]
+        return event if (now - event.timestamp) <= self.event_ttl else None

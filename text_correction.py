@@ -1,137 +1,95 @@
+# -*- coding: utf-8 -*-
 import re
 import threading
 from difflib import SequenceMatcher
 
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+FILLER_PATTERNS = [re.compile(p) for p in (
+    r"\bээ+\b", r"\bэм+\b", r"\bну\b", r"\bкак бы\b", r"\bэто самое\b", r"\bв общем\b")]
+
+# если модель переписала фразу слишком сильно - оставляем исходную
+MIN_SIMILARITY = 0.6
 
 
 class SafeMeaningCorrectionModule:
     def __init__(self, model_name="cointegrated/rut5-small-normalizer"):
         print("Загрузка модели коррекции текста...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
         self.lock = threading.Lock()
-        print("Модель коррекции загружена")
+        self.tokenizer = None
+        self.model = None
 
-    def normalize_spaces(self, text):
-        return re.sub(r"\s+", " ", text.strip())
+        try:
+            self.tokenizer, self.model = self._load_model(model_name)
+            print("Модель коррекции текста загружена.")
+        except Exception as error:
+            print("Модель коррекции недоступна, работаю только с базовой очисткой:", error)
 
-    def basic_cleanup(self, text):
-        text = self.normalize_spaces(text)
+    @staticmethod
+    def _load_model(model_name):
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        if not text:
-            return text
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name, local_files_only=True)
+            print("Модель коррекции найдена в локальном кэше.")
+            return tokenizer, model
+        except Exception:
+            pass
 
-        text = text.replace(" ,", ",")
-        text = text.replace(" .", ".")
-        text = text.replace(" !", "!")
-        text = text.replace(" ?", "?")
-        text = text.replace(" :", ":")
-        text = text.replace(" ;", ";")
+        print("Локального кэша нет, скачиваю модель коррекции...")
+        return (AutoTokenizer.from_pretrained(model_name),
+                AutoModelForSeq2SeqLM.from_pretrained(model_name))
+
+    @staticmethod
+    def basic_cleanup(text):
+        text = re.sub(r"\s+", " ", (text or "").strip())
+        for mark in (",", ".", "!", "?", ":", ";"):
+            text = text.replace(f" {mark}", mark)
+
+        result = []
+        for word in text.split():
+            if result and word.lower() == result[-1].lower():
+                continue
+            result.append(word)
+        text = " ".join(result)
 
         if text and text[0].isalpha():
             text = text[0].upper() + text[1:]
-
-        return text
+        return text.strip()
 
     def looks_broken(self, text):
-        if not text:
-            return False
-
+        text = self.basic_cleanup(text)
         words = text.split()
         if len(words) < 3:
             return False
 
-        lower = text.lower()
+        repeated = sum(1 for i in range(1, len(words))
+                       if words[i].lower() == words[i - 1].lower())
+        if repeated >= 2:
+            return True
 
-        repeated_words = 0
-        for i in range(1, len(words)):
-            if words[i].lower() == words[i - 1].lower():
-                repeated_words += 1
-
-        short_words = sum(1 for w in words if len(w) <= 2)
-        short_ratio = short_words / max(len(words), 1)
-
-        repeated_chars = bool(re.search(r"(.)\1\1", lower))
-        no_punctuation = not any(ch in text for ch in ".!?,")
-        many_fillers = any(
-            filler in lower for filler in ["ээ", "мм", "ну ну", "а а", "это это"]
-        )
-
-        return (
-            repeated_words >= 1
-            or short_ratio > 0.45
-            or repeated_chars
-            or no_punctuation
-            or many_fillers
-        )
-
-    def safe_accept(self, original, corrected):
-        original = self.normalize_spaces(original)
-        corrected = self.normalize_spaces(corrected)
-
-        if not corrected:
-            return False
-
-        similarity = SequenceMatcher(None, original.lower(), corrected.lower()).ratio()
-
-        original_words = original.split()
-        corrected_words = corrected.split()
-
-        if not corrected_words:
-            return False
-
-        length_ratio = len(corrected_words) / max(len(original_words), 1)
-
-        if similarity < 0.45:
-            return False
-
-        if length_ratio < 0.6 or length_ratio > 1.6:
-            return False
-
-        return True
-
-    def generate_correction(self, text):
-        with self.lock:
-            inputs = self.tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=128
-            )
-
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=128,
-                num_beams=4,
-                do_sample=False
-            )
-
-            corrected = self.tokenizer.decode(
-                outputs[0],
-                skip_special_tokens=True
-            ).strip()
-
-        return corrected
+        low = text.lower()
+        return any(len(p.findall(low)) >= 2 for p in FILLER_PATTERNS)
 
     def correct(self, text):
         text = self.basic_cleanup(text)
-
-        if not text:
-            return text
-
-        if not self.looks_broken(text):
+        if not text or self.model is None:
             return text
 
         try:
-            corrected = self.generate_correction(text)
-            corrected = self.basic_cleanup(corrected)
+            with self.lock:
+                inputs = self.tokenizer(text, return_tensors="pt",
+                                        truncation=True, max_length=256)
+                outputs = self.model.generate(**inputs, max_length=256,
+                                              num_beams=2, do_sample=False)
+                corrected = self.basic_cleanup(
+                    self.tokenizer.decode(outputs[0], skip_special_tokens=True))
 
-            if self.safe_accept(text, corrected):
-                return corrected
+            if not corrected:
+                return text
 
-            return text
+            similarity = SequenceMatcher(None, text.lower(), corrected.lower()).ratio()
+            return corrected if similarity >= MIN_SIMILARITY else text
 
         except Exception as error:
-            print("Ошибка коррекции:", error)
+            print("Ошибка коррекции текста:", error)
             return text
