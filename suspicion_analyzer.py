@@ -74,6 +74,7 @@ class SuspicionAnalyzerModule:
 
     def start_calibration(self, silent=False):
         self.baseline_ready = False
+        self.baseline_personal = False  # True - база собрана по этому человеку
         self.baseline_samples = []
         self.valid_time = 0.0
         self.last_t = None
@@ -92,6 +93,7 @@ class SuspicionAnalyzerModule:
     def _use_defaults(self):
         """Типичные значения вместо личной базы: индикатор работает с первой секунды."""
         self.baseline_ready = True
+        self.baseline_personal = False
         self.base_mimic = 0.05
         self.base_blink_rate = 17.0
         self.base_gaze = 0.25
@@ -285,6 +287,7 @@ class SuspicionAnalyzerModule:
         self.base_blink_rate = blinks / max(self.valid_time, 1e-6) * 60.0
 
         self.baseline_ready = True
+        self.baseline_personal = True
         self.baseline_samples = []
         print(f"Личная база собрана: моргания {self.base_blink_rate:.1f}/мин.")
 

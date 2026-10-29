@@ -11,20 +11,30 @@ MIN_SIMILARITY = 0.6
 
 
 class SafeMeaningCorrectionModule:
-    def __init__(self, model_name="cointegrated/rut5-small-normalizer"):
-        print("Загрузка модели коррекции текста...")
+    def __init__(self, model_name="cointegrated/rut5-small-normalizer",
+                 allow_download=True, load_model=True):
+        """load_model=False - только базовая очистка, без нейросети."""
         self.lock = threading.Lock()
         self.tokenizer = None
         self.model = None
+        self.error = ""
+        if not load_model:
+            return
 
+        print("Загрузка модели коррекции текста...")
         try:
-            self.tokenizer, self.model = self._load_model(model_name)
+            self.tokenizer, self.model = self._load_model(model_name, allow_download)
             print("Модель коррекции текста загружена.")
         except Exception as error:
+            self.error = str(error)
             print("Модель коррекции недоступна, работаю только с базовой очисткой:", error)
 
     @staticmethod
-    def _load_model(model_name):
+    def _load_model(model_name, allow_download=True):
+        import importlib.util
+
+        if importlib.util.find_spec("sentencepiece") is None:  # токенизатор T5 без него не грузится
+            raise RuntimeError("не установлен пакет sentencepiece (pip install sentencepiece)")
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         try:
@@ -32,9 +42,12 @@ class SafeMeaningCorrectionModule:
             model = AutoModelForSeq2SeqLM.from_pretrained(model_name, local_files_only=True)
             print("Модель коррекции найдена в локальном кэше.")
             return tokenizer, model
-        except Exception:
-            pass
+        except Exception as error:
+            print("Модель коррекции не загрузилась из локального кэша:", str(error)[:200])
 
+        if not allow_download:
+            raise RuntimeError("модели коррекции нет на компьютере, "
+                               "а загрузка из интернета отключена в настройках")
         print("Локального кэша нет, скачиваю модель коррекции...")
         return (AutoTokenizer.from_pretrained(model_name),
                 AutoModelForSeq2SeqLM.from_pretrained(model_name))

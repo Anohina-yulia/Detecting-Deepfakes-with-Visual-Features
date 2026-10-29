@@ -6,26 +6,57 @@ from difflib import SequenceMatcher
 
 LIVE_TTL = 5.0  # сколько секунд живой текст остаётся на экране без обновлений
 
+# Типичные "галлюцинации" Whisper на тишине и шуме (русские субтитры из обучающих данных):
+# "Субтитры сделал DimaTorzok", "Субтитры А.Семкин", "Редактор субтитров ...".
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+_NAME_INITIAL = re.compile(r"\b[А-ЯЁA-Z]\.\s?[А-ЯЁA-Z][а-яёa-z]+")
+_SUBTITLE_WORD = re.compile(r"субтитр", re.IGNORECASE)
+_SUBTITLE_CREDIT = re.compile(
+    r"субтитр\w*\s+субтитр|\b(сделал|создавал|подогнал|делал|редактор|корректор|автор)\w*",
+    re.IGNORECASE)
+_FULL_HALLUCINATIONS = re.compile(
+    r"^(продолжение следует|спасибо за просмотр|подписывайтесь на (наш )?канал|"
+    r"ставьте лайки?|dimatorzok)[.!…\s]*$",
+    re.IGNORECASE)
+
+
+def _is_hallucinated_sentence(sentence):
+    text = sentence.strip()
+    if not text:
+        return True
+    if "dimatorzok" in text.lower() or _FULL_HALLUCINATIONS.match(text):
+        return True
+    if _SUBTITLE_WORD.search(text):
+        return bool(_SUBTITLE_CREDIT.search(text) or _NAME_INITIAL.search(text)
+                    or len(text.split()) <= 3)
+    return False
+
 
 class WhisperSubtitleModule:
-    def __init__(self, model_size="small"):
+    def __init__(self, model_size="small", allow_download=True):
         print("Загрузка модели Whisper...")
         from faster_whisper import WhisperModel
 
-        self.model = self._load_model(WhisperModel, model_size)
+        self.model_size = model_size
+        self.model = self._load_model(WhisperModel, model_size, allow_download)
         print("Whisper загружен.")
 
         self.lock = threading.Lock()
-        self.current_live_text = ""
-        self.live_time = 0.0
-        self.final_lines = []
+        self.reset()
 
-        self.last_live_text = ""
-        self.last_final_text = ""  # последнее ОКНО распознавания (не накопленный текст)
-        self.last_raw_text = ""
+    def reset(self):
+        """Очистить текст перед новой сессией (модель остаётся загруженной)."""
+        with self.lock:
+            self.current_live_text = ""
+            self.live_time = 0.0
+            self.final_lines = []
+
+            self.last_live_text = ""
+            self.last_final_text = ""  # последнее ОКНО распознавания (не накопленный текст)
+            self.last_raw_text = ""
 
     @staticmethod
-    def _load_model(WhisperModel, model_size):
+    def _load_model(WhisperModel, model_size, allow_download=True):
         try:
             model = WhisperModel(model_size, device="cpu", compute_type="int8",
                                  local_files_only=True)
@@ -34,8 +65,20 @@ class WhisperSubtitleModule:
         except Exception:
             pass
 
+        if not allow_download:
+            raise RuntimeError(f"модели Whisper '{model_size}' нет на компьютере, "
+                               "а загрузка из интернета отключена в настройках")
         print("Локального кэша нет, скачиваю модель Whisper (один раз)...")
         return WhisperModel(model_size, device="cpu", compute_type="int8")
+
+    @staticmethod
+    def strip_hallucinations(text):
+        """Убирает предложения-"галлюцинации" (подписи субтитров и т.п.)."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        kept = [s for s in _SENTENCE_SPLIT.split(text) if not _is_hallucinated_sentence(s)]
+        return " ".join(s.strip() for s in kept).strip()
 
     # ---------- очистка ----------
 

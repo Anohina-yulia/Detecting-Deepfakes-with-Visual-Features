@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import time
 
 import cv2
@@ -7,13 +8,30 @@ import mediapipe as mp
 from models import FaceData, POS_CENTER, POS_LEFT, POS_NONE, POS_RIGHT
 
 
+def _resolve_model_path(model_path):
+    """Относительный путь ищется сначала от текущей папки, затем от папки проекта."""
+    if os.path.isabs(model_path) or os.path.exists(model_path):
+        return model_path
+    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path)
+    return candidate if os.path.exists(candidate) else model_path
+
+
 class NeuralFaceAnalyzerModule:
     def __init__(self, model_path="models/face_landmarker.task"):
         self.mp = mp
         vision = mp.tasks.vision
 
+        model_path = _resolve_model_path(model_path)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Не найдена модель лица: {model_path}. "
+                "Положите файл face_landmarker.task в папку models проекта.")
+        # модель читается в память: MediaPipe на Windows не открывает пути с кириллицей
+        with open(model_path, "rb") as file:
+            model_data = file.read()
+
         options = vision.FaceLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
+            base_options=mp.tasks.BaseOptions(model_asset_buffer=model_data),
             running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
             min_face_detection_confidence=0.5,

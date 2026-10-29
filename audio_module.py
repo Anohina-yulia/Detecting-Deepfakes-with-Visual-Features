@@ -45,24 +45,67 @@ class AudioModule:
             self._last_status_print = time.time()
         self.feed(indata)
 
-    def start(self):
+    def start(self, device=None):
+        """device - индекс устройства ввода sounddevice (None - по умолчанию)."""
         import sounddevice as sd
 
-        self.stream = sd.InputStream(
+        if self.stream is not None:
+            return
+        stream = sd.InputStream(
             samplerate=self.samplerate,
             channels=self.channels,
             blocksize=self.blocksize,
             dtype="float32",
+            device=device,
             callback=self.callback,
         )
-        self.stream.start()
+        stream.start()
+        self.stream = stream
+
+    @property
+    def active(self):
+        return self.stream is not None
 
     def get_volume(self):
         with self.lock:
             return self.volume
 
+    def clear_queue(self):
+        """Выбросить накопленные блоки (после паузы старый звук не нужен)."""
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def stop(self):
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as error:
+                print("Ошибка при закрытии микрофона:", error)
+        with self.lock:
+            self.volume = 0.0
+
+
+def list_input_devices():
+    """[(индекс, название)] устройств ввода; пустой список, если звук недоступен."""
+    try:
+        import sounddevice as sd
+
+        devices = sd.query_devices()
+        default_api = sd.default.hostapi if hasattr(sd.default, "hostapi") else None
+        result = []
+        for index, info in enumerate(devices):
+            if info.get("max_input_channels", 0) <= 0:
+                continue
+            # MME дублирует устройства других API - показываем только API по умолчанию
+            if default_api is not None and default_api >= 0 and info.get("hostapi") != default_api:
+                continue
+            result.append((index, info.get("name", f"Устройство {index}")))
+        return result
+    except Exception as error:
+        print("Не удалось получить список микрофонов:", error)
+        return []

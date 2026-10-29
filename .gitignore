@@ -12,3 +12,5 @@ results/
 /analysis_log.csv
 /subtitles.txt
 /subtitles_live.txt
+logs/
+settings.json

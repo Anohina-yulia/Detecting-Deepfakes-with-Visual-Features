@@ -105,6 +105,10 @@ class VideoFileSource:
         """Время только что прочитанного кадра в секундах от начала видео."""
         return max(self.current_frame - 1, 0) / self.fps
 
+    def get_duration(self):
+        """Длительность видео в секундах (0, если контейнер её не сообщает)."""
+        return self.frame_count / self.fps if self.frame_count > 0 else 0.0
+
     def release(self):
         self.cap.release()
 

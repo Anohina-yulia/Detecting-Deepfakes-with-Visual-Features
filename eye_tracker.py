@@ -43,6 +43,10 @@ class EyeTrackerModule:
         self.last_horizontal_ratio = 0.5
         self.last_vertical_ratio = 0.5
 
+        # длительность закрытия глаз (по времени кадров, а не по их числу)
+        self.closure_start = None      # когда глаза закрылись, с
+        self.last_closure_ms = None    # длительность последнего моргания, мс
+
     # ---------- вычисления ----------
 
     @staticmethod
@@ -93,25 +97,42 @@ class EyeTrackerModule:
             return v
         return GAZE_CENTER
 
-    def update_blink_counter(self, ear):
+    def update_blink_counter(self, ear, now=None):
+        """now - время кадра, с (нужно только для длительности закрытия глаз)."""
         self.ear_history.append(ear)
         smooth = float(sum(self.ear_history) / len(self.ear_history))
         self.last_ear = smooth
 
         if smooth < self.ear_threshold:
+            if self.closure_start is None and now is not None:
+                self.closure_start = now
             self.closed_frames += 1
             if self.closed_frames >= self.min_closed_frames:
                 self.blink_in_progress = True
         else:
             if self.blink_in_progress:
                 self.blink_count += 1
+                if now is not None and self.closure_start is not None:
+                    self.last_closure_ms = max(now - self.closure_start, 0.0) * 1000.0
             self.closed_frames = 0
             self.blink_in_progress = False
+            self.closure_start = None
+
+    @property
+    def eyes_closed(self):
+        return self.blink_in_progress
+
+    def current_closure_seconds(self, now):
+        """Сколько секунд глаза закрыты сейчас (0, если открыты)."""
+        if not self.blink_in_progress or self.closure_start is None:
+            return 0.0
+        return max(now - self.closure_start, 0.0)
 
     def _reset_blink_state(self):
         """Лицо пропало - незавершённое моргание не засчитываем."""
         self.closed_frames = 0
         self.blink_in_progress = False
+        self.closure_start = None
         self.ear_history.clear()
 
     @staticmethod
@@ -134,8 +155,24 @@ class EyeTrackerModule:
 
     # ---------- основной вызов ----------
 
-    def process(self, frame, face_data):
-        """Обновляет моргания и взгляд, рисует контуры глаз. Панель - в render_panel."""
+    def draw_eyes(self, frame, face_data):
+        """Контуры глаз и радужки на кадре (классический режим и сохраняемое видео)."""
+        if not face_data.detected or not face_data.landmarks:
+            return frame
+        pts = face_data.landmarks
+        pick = lambda ids: [pts[i] for i in ids]
+        self._draw_eye_shape(frame, pick(self.LEFT_EYE_CONTOUR), (255, 0, 255))
+        self._draw_eye_shape(frame, pick(self.RIGHT_EYE_CONTOUR), (255, 0, 255))
+        self._draw_iris(frame, pick(self.LEFT_IRIS))
+        self._draw_iris(frame, pick(self.RIGHT_IRIS))
+        return frame
+
+    def process(self, frame, face_data, draw=True):
+        """Обновляет моргания и взгляд. draw=True - рисует контуры глаз на кадре.
+
+        Новый интерфейс рисует подсветку сам, поэтому передаёт draw=False.
+        Панель классического режима - в render_panel.
+        """
         self.face_found = face_data.detected
         self.last_face_position = face_data.face_position
 
@@ -149,7 +186,7 @@ class EyeTrackerModule:
 
         left_ear = self.compute_ear(pick(self.LEFT_EYE_EAR))
         right_ear = self.compute_ear(pick(self.RIGHT_EYE_EAR))
-        self.update_blink_counter((left_ear + right_ear) / 2.0)
+        self.update_blink_counter((left_ear + right_ear) / 2.0, now=face_data.timestamp)
 
         left_iris, right_iris = pick(self.LEFT_IRIS), pick(self.RIGHT_IRIS)
         left_contour, right_contour = pick(self.LEFT_EYE_CONTOUR), pick(self.RIGHT_EYE_CONTOUR)
@@ -164,10 +201,8 @@ class EyeTrackerModule:
         self.last_gaze = self.classify_gaze(self.last_horizontal_ratio,
                                             self.last_vertical_ratio)
 
-        self._draw_eye_shape(frame, left_contour, (255, 0, 255))
-        self._draw_eye_shape(frame, right_contour, (255, 0, 255))
-        self._draw_iris(frame, left_iris)
-        self._draw_iris(frame, right_iris)
+        if draw:
+            self.draw_eyes(frame, face_data)
         return frame
 
     # ---------- панель ----------

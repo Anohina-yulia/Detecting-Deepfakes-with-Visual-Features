@@ -48,6 +48,8 @@ class RednessAnalyzerModule:
 
     @staticmethod
     def gray_world_normalize(patch):
+        """Нормализация по самому участку (прежний вариант, больше не используется:
+        средний цвет кожи становится серым, и маска кожи отбрасывает участок)."""
         patch_f = patch.astype(np.float32) + 1.0
         b, g, r = cv2.split(patch_f)
         mean_b, mean_g, mean_r = float(b.mean()), float(g.mean()), float(r.mean())
@@ -55,11 +57,27 @@ class RednessAnalyzerModule:
         merged = cv2.merge([b * gray / mean_b, g * gray / mean_g, r * gray / mean_r])
         return np.clip(merged, 0, 255).astype(np.uint8)
 
-    def compute_patch_metric(self, patch):
+    @staticmethod
+    def gray_world_gains(frame):
+        """Коэффициенты баланса белого по всему кадру ("серый мир").
+
+        Снимают цветной оттенок освещения, но сохраняют цвет кожи относительно
+        сцены - а значит, и само покраснение щёк.
+        """
+        means = np.array(cv2.mean(frame)[:3], dtype=np.float32) + 1.0
+        return (means.mean() / means).astype(np.float32)
+
+    @staticmethod
+    def apply_gains(patch, gains):
+        balanced = patch.astype(np.float32) * gains.reshape(1, 1, 3)
+        return np.clip(balanced, 0, 255).astype(np.uint8)
+
+    def compute_patch_metric(self, patch, gains=None):
         if patch is None or patch.size == 0:
             return 0.0
 
-        patch = self.gray_world_normalize(patch)
+        if gains is not None:
+            patch = self.apply_gains(patch, gains)
         b, g, r = cv2.split(patch)
         hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
         ycrcb = cv2.cvtColor(patch, cv2.COLOR_BGR2YCrCb)
@@ -86,14 +104,14 @@ class RednessAnalyzerModule:
         raw = 0.34 * rg_metric + 0.36 * crcb_metric + 0.30 * lab_metric
         return clamp01((raw - 0.01) * 3.8)
 
-    def sample_patch_score(self, frame, center, half_w, half_h):
+    def sample_patch_score(self, frame, center, half_w, half_h, gains=None):
         h, w = frame.shape[:2]
         cx, cy = center
         x1, y1 = max(cx - half_w, 0), max(cy - half_h, 0)
         x2, y2 = min(cx + half_w, w - 1), min(cy + half_h, h - 1)
         if x2 <= x1 or y2 <= y1:
             return 0.0, (x1, y1, x2, y2)
-        return self.compute_patch_metric(frame[y1:y2, x1:x2]), (x1, y1, x2, y2)
+        return self.compute_patch_metric(frame[y1:y2, x1:x2], gains), (x1, y1, x2, y2)
 
     @staticmethod
     def status_from_score(score):
@@ -161,9 +179,10 @@ class RednessAnalyzerModule:
         raw, boxes = {}, {}
         box_names = {"left": "left_cheek", "right": "right_cheek",
                      "nose": "nose", "forehead": "forehead"}
+        gains = self.gray_world_gains(frame)
         for name in ZONES:
             raw[name], boxes[box_names[name]] = self.sample_patch_score(
-                frame, centers[name], *sizes[name])
+                frame, centers[name], *sizes[name], gains=gains)
 
         if not self.neutral_ready:
             if allow_calibration:

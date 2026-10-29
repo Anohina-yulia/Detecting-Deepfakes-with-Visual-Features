@@ -25,6 +25,8 @@ from datetime import datetime
 
 import numpy as np
 
+from app_paths import RESULTS_DIR
+
 TRUTH, LIE = "правда", "ложь"
 MIN_SEG_SECONDS = 3.0     # фрагменты короче не учитываются
 MIN_BLINK_SPAN = 4.0      # для частоты морганий нужен фрагмент не короче
@@ -262,7 +264,7 @@ def build_report(paths, segments, results):
 
 
 def main():
-    args = sys.argv[1:] or ["results/*/analysis_log.csv"]
+    args = sys.argv[1:] or [os.path.join(RESULTS_DIR, "*", "analysis_log.csv")]
     paths = []
     for arg in args:
         found = glob.glob(arg)
@@ -290,13 +292,13 @@ def main():
     report = build_report(paths, segments, results)
     print(report)
 
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = os.path.join("results", f"оценка_{stamp}.txt")
+    report_path = os.path.join(RESULTS_DIR, f"оценка_{stamp}.txt")
     with open(report_path, "w", encoding="utf-8") as file:
         file.write(report)
 
-    seg_path = os.path.join("results", f"фрагменты_{stamp}.csv")
+    seg_path = os.path.join(RESULTS_DIR, f"фрагменты_{stamp}.csv")
     with open(seg_path, "w", newline="", encoding="utf-8-sig") as file:
         writer = csv.writer(file, delimiter=";")
         writer.writerow(["сеанс", "участник", "метка", "секунд"] + [n for n, _ in FEATURES])

@@ -29,3 +29,15 @@ def exclude_window_from_capture(window_title):
 def include_window_in_capture(window_title):
     """Возвращает окно в захват экрана."""
     return _set_affinity(window_title, WDA_NONE)
+
+
+def set_hwnd_capture_excluded(hwnd, excluded=True):
+    """То же по дескриптору окна (новый интерфейс знает свой HWND)."""
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        flag = WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE
+        return bool(ctypes.windll.user32.SetWindowDisplayAffinity(int(hwnd), flag))
+    except Exception as error:
+        print("Ошибка защиты окна от захвата:", error)
+        return False

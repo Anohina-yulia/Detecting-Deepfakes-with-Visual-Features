@@ -84,3 +84,22 @@ class MicroEvent:
     strength: float
     duration_ms: float  # длительность нарастания (измеренная), а не константа
     timestamp: float
+
+
+# --- События сессии (журнал и временная шкала) ---
+EV_CALIBRATION = "калибровка"
+EV_FACE = "лицо"
+EV_MICRO = "мимика"
+EV_EYES = "глаза"
+EV_SPEECH = "речь"
+EV_QUALITY = "качество"
+EV_LABEL = "разметка"
+EV_SYSTEM = "система"
+
+
+@dataclass
+class SessionEvent:
+    t: float            # время сессии, с
+    kind: str           # одна из констант EV_*
+    text: str
+    level: str = "info"  # info | notice | warning | error

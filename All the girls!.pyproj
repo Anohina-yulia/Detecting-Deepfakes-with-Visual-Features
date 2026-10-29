@@ -33,7 +33,7 @@
     <Compile Include="micro_expression.py" />
     <Compile Include="app.py" />
     <Compile Include="mimic_analyzer.py" />
-    <Compile Include="NeuralFaceAnalyzerModule.pyw" />
+    <Compile Include="NeuralFaceAnalyzerModule.py" />
     <Compile Include="neural_face_analyzer.py">
       <SubType>Code</SubType>
     </Compile>
@@ -52,6 +52,36 @@
     <Compile Include="models.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="app_paths.py" />
+    <Compile Include="settings_store.py" />
+    <Compile Include="analysis_pipeline.py" />
+    <Compile Include="speech_engine.py" />
+    <Compile Include="session_timeline.py" />
+    <Compile Include="session_history.py" />
+    <Compile Include="gui\__init__.py" />
+    <Compile Include="gui\app.py" />
+    <Compile Include="gui\theme.py" />
+    <Compile Include="gui\icons.py" />
+    <Compile Include="gui\widgets.py" />
+    <Compile Include="gui\video_stage.py" />
+    <Compile Include="gui\observations.py" />
+    <Compile Include="gui\timeline_view.py" />
+    <Compile Include="gui\transcript.py" />
+    <Compile Include="gui\dialogs.py" />
+    <Compile Include="gui\session_worker.py" />
+    <Compile Include="gui\main_window.py" />
+    <Compile Include="tests\test_core.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="gui\" />
+    <Folder Include="gui\assets\" />
+    <Folder Include="tests\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="gui\assets\chevron-down.svg" />
+    <Content Include="requirements-main.txt" />
+    <Content Include="run.bat" />
+    <Content Include="README.md" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
