@@ -78,6 +78,7 @@
     <Folder Include="tests\" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="gui\assets\app.ico" />
     <Content Include="gui\assets\chevron-down.svg" />
     <Content Include="requirements-main.txt" />
     <Content Include="run.bat" />
